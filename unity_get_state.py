@@ -1,41 +1,46 @@
-#!/usr/bin/python3
-# -*- coding: utf-8 -*-
 
-import os
-import time
-import argparse
-import sys
-import json
-import subprocess
-import logging
-import logging.handlers
+# Developed by : Behzad Kianbakht (2023/12/05)
+# ---------------------------------------------------------------------------------------
+
 import requests
 import urllib3
-#urllib3.disable_warnings()
-#urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import logging
+import logging.handlers
+import sys
+import json
+import time
+from pyzabbix import ZabbixMetric , ZabbixSender
 
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+script_type = sys.argv[1]
+# List of unity storage Name and IP ; This Name should be same as Host Name in Zabbix
+storage_list = [["Unity1","192.0.0.0"],["Unity2","192.0.0.20"]]
 
 
-# Create log-object
-LOG_FILENAME = "/tmp/unity_state.log"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+#-----------------------------------------------------------------------
+unity_api_user = "UserName"
+unity_api_pass = "PassWord"
+unity_api_port = "443"
+list_resources = ['battery','ssd','ethernetPort','fcPort','sasPort','fan','powerSupply','storageProcessor','lun','pool','dae','dpe','ioModule','lcc','memoryModule','ssc','uncommittedPort','disk']
+#-----------------------------------------------------------------------
+
+Zabbix_Interface_IP = "127.0.0.1"
+
+#-----------------------------------------------------------------------
+LOG_FILENAME = "/var/log/zabbix/storage_device_log/unity.log"
+#print(LOG_FILENAME)
 unity_logger = logging.getLogger("unity_logger")
 unity_logger.setLevel(logging.INFO)
 
-# Set handler
 unity_handler = logging.handlers.RotatingFileHandler(LOG_FILENAME, maxBytes=1024*1024, backupCount=5)
 unity_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-# Set formatter for handler
 unity_handler.setFormatter(unity_formatter)
-
-# Add handler to log-object
 unity_logger.addHandler(unity_handler)
+#-----------------------------------------------------------------------
 
-
-def api_connect(api_user, api_password, api_ip, api_port):
-	api_login_url = "https://{0}:{1}/api/types/loginSessionInfo".format(api_ip, api_port)
+def api_connect(api_user,api_password,api_ip,api_port):
+	api_login_url = "https://{0}:{1}/api/types/loginSessionInfo".format(api_ip,api_port)
 	session_unity = requests.Session()
 	session_unity.auth = (api_user, api_password)
 	session_unity.headers = {'X-EMC-REST-CLIENT': 'true', 'Content-type': 'application/json', 'Accept': 'application/json'}
@@ -57,9 +62,8 @@ def api_connect(api_user, api_password, api_ip, api_port):
 		sys.exit("70")
 
 
-
 def api_logout(api_ip, session_unity):
-	api_logout_url = "https://{0}/api/types/loginSessionInfo/action/logout".format(api_ip)
+	api_logout_url = "https://{0}/api/types/loginSessionInfo/action/logout".format(api_ip) 
 	session_unity.headers = {'Content-type': 'application/json', 'Accept': 'application/json'}
 
 	try:
@@ -78,32 +82,28 @@ def api_logout(api_ip, session_unity):
 		sys.exit("170")
 
 
-def convert_to_zabbix_json(data):
-        output = json.dumps({"data": data}, indent = None, separators = (',',': '))
-        return output
-
-
-
-def send_data_to_zabbix(zabbix_data, storage_name):
-        sender_command = "/usr/bin/zabbix_sender"
-        config_path = "/etc/zabbix/zabbix_agentd.conf"
-        time_of_create_file = int(time.time())
-        temp_file = "/tmp/{0}_{1}.tmp".format(storage_name, time_of_create_file)
-
-        with open(temp_file, "w") as f:
-                f.write("")
-                f.write("\n".join(zabbix_data))
-
-        send_code = subprocess.call([sender_command, "-vv", "-c", config_path, "-s", storage_name, "-T", "-i", temp_file], stdout = subprocess.PIPE, stderr = subprocess.PIPE)
-        os.remove(temp_file)
-        return send_code
-
+def convert_to_zabbix_json(data,storage_name,resource,timestampnow,):
+        if script_type == "discovery":
+            output = {}
+            output = {
+				"data" : data,
+				"Host_Name" : storage_name,
+				"key" : resource,
+				"time" : timestampnow
+			}
+            return output
+        elif script_type == "status":
+            pass
 
 
 def discovering_resources(api_user, api_password, api_ip, api_port, storage_name, list_resources):
 	api_session = api_connect(api_user, api_password, api_ip, api_port)
-
+	try:
+		zbx = ZabbixSender(Zabbix_Interface_IP,chunk_size=1000)
+	except:
+		print("zabbix connection can not establish")
 	xer = []
+	packet = []
 	try:
 		for resource in list_resources:
 			resource_url = "https://{0}:{1}/api/types/{2}/instances?fields=name".format(api_ip, api_port, resource)
@@ -121,21 +121,24 @@ def discovering_resources(api_user, api_password, api_ip, api_port, storage_name
 					one_object_list = {}
 					one_object_list["{#ID}"] = one_object['content']['id']
 					discovered_resource.append(one_object_list)
-			converted_resource = convert_to_zabbix_json(discovered_resource)
 			timestampnow = int(time.time())
-			xer.append("%s %s %s %s" % (storage_name, resource, timestampnow, converted_resource))
-	except Exception as oops:
+			xer.append(discovered_resource)
+			converted_resource = convert_to_zabbix_json(discovered_resource,storage_name,resource,timestampnow)
+			packet = [ZabbixMetric(host=converted_resource["Host_Name"],key=converted_resource["key"],value=json.dumps(converted_resource["data"]))]
+			zbx.send(packet)
+		print("send data to zabbix DONE!")
+	except Exception as e:
 		unity_logger.error("Error occurs in discovering")
 		sys.exit("1000")
-
-	api_session_logout = api_logout(api_ip, api_session)
-	return send_data_to_zabbix(xer, storage_name)
-
+	api_logout(api_ip,api_session) 
 
 
 def get_status_resources(api_user, api_password, api_ip, api_port, storage_name, list_resources):
 	api_session = api_connect(api_user, api_password, api_ip, api_port)
-
+	try:
+		zbx = ZabbixSender(Zabbix_Interface_IP,chunk_size=1000)
+	except:
+		print("zabbix connection can not establish")
 	state_resources = [] # This list will persist state of resources (pool, lun, fcPort, battery, diks, ...) on zabbix format
 	try:
 		for resource in list_resources:
@@ -202,37 +205,34 @@ def get_status_resources(api_user, api_password, api_ip, api_port, storage_name,
 					key_status = "running.{0}.[{1}]".format(resource, one_object['content']['id'].replace(' ', '_'))
 					state_resources.append("%s %s %s %s" % (storage_name, key_health, timestampnow, one_object['content']['health']['value']))
 					state_resources.append("%s %s %s %s" % (storage_name, key_status, timestampnow, running_status))
+
+		for status_details in state_resources:
+			status_details_list = status_details.split(" ")
+			#print(status_details_list)
+			packet = [ZabbixMetric(host=status_details_list[0],key=status_details_list[1],value=int(status_details_list[3]))]
+			#print(packet)
+			zbx.send(packet)
+		print("send data to zabbix DONE!")
+
 	except Exception as oops:
+		# print("failed Status")
+		# print(oops)
 		unity_logger.error("Error occured in get state")
 		sys.exit("1000")
-
-	api_session_logout = api_logout(api_ip, api_session)
-	return send_data_to_zabbix(state_resources, storage_name)
+	api_logout(api_ip, api_session)
 
 
-
-def main():
-	# Parsing arguments
-	unity_parser = argparse.ArgumentParser()
-	unity_parser.add_argument('--api_ip', action="store", help="Where to connect", required=True)
-	unity_parser.add_argument('--api_port', action="store", required=True)
-	unity_parser.add_argument('--api_user', action="store", required=True)
-	unity_parser.add_argument('--api_password', action="store", required=True)
-	unity_parser.add_argument('--storage_name', action="store", required=True)
-
-	group = unity_parser.add_mutually_exclusive_group(required=True)
-	group.add_argument('--discovery', action ='store_true')
-	group.add_argument('--status', action='store_true')
-	arguments = unity_parser.parse_args()
-
-	list_resources = ['battery','ssd','ethernetPort','fcPort','sasPort','fan','powerSupply','storageProcessor','lun','pool','dae','dpe','ioModule','lcc','memoryModule','ssc','uncommittedPort','disk']
-	if arguments.discovery:
-		result_discovery = discovering_resources(arguments.api_user, arguments.api_password, arguments.api_ip, arguments.api_port, arguments.storage_name, list_resources)
-		print (result_discovery)
-	elif arguments.status:
-		result_status = get_status_resources(arguments.api_user, arguments.api_password, arguments.api_ip, arguments.api_port, arguments.storage_name, list_resources)
-		print (result_status)
-
-if __name__ == "__main__":
-	main()
-
+#---------------------------------------------------------------------------
+for i in range(0,len(storage_list)):
+	if script_type == "discovery":
+		try:
+			result_discovery = discovering_resources(api_user=unity_api_user,api_password=unity_api_pass,api_ip=storage_list[i][1],api_port=unity_api_port,storage_name=storage_list[i][0],list_resources=list_resources)
+		except Exception as e:
+			print(f"Discovery Error: {e}")
+	elif script_type == "status":
+		try:
+			result_status = get_status_resources(api_user=unity_api_user,api_password=unity_api_pass,api_ip=storage_list[i][1],api_port=unity_api_port,storage_name=storage_list[i][0],list_resources=list_resources)
+		except Exception as e:
+			print(f"Status Error: {e}")
+	else:
+		print("Input arg not define - ( discovery or status )")
